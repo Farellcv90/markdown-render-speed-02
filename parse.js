@@ -2583,8 +2583,12 @@ function renderItem(item, refs, loose, state) {
   let out = '<li>';
   const ctx = { loose };
   let first = true;
-  for (let idx = 0; idx < item.children.length; idx++) {
-    const child = item.children[idx];
+  // Hoist the children array and its length out of the loop: the
+  // per-child lookup of item.children / .length ran on every child.
+  const children = item.children;
+  const nChildren = children.length;
+  for (let idx = 0; idx < nChildren; idx++) {
+    const child = children[idx];
     if (first && child.type === 'paragraph') {
       const m = /^\[([ xX])\] /.exec(child.text);
       if (m) {
@@ -2605,7 +2609,7 @@ function renderItem(item, refs, loose, state) {
       // the next source line is blank (stripTrailing); otherwise the
       // newline is kept before the following block.
       let text = child.lines.map((l, idx) => l + (idx === child.lines.length - 1 && child.noTrailingNL ? '' : '\n')).join('');
-      const isLast = idx === item.children.length - 1;
+      const isLast = idx === nChildren - 1;
       if ((isLast || child.stripTrailing) && text.endsWith('\n')) text = text.slice(0, -1);
       out += text;
       first = false;

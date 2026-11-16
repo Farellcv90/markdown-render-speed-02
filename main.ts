@@ -1,3 +1,6 @@
+// Entrypoint for the make.fun markdown-render-speed-02 entry.
+// Wires the from-scratch parser (parse.js) to the competition's
+// Node 22 driver contract: cases.json in, html.json out.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
