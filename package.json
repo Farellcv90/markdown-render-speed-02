@@ -1,1 +1,1 @@
-{"description":"Dependency-free Markdown renderer matching marked 18.1.3 default output","type":"module"}
+{"description":"A fast, dependency-free Markdown parser matching marked 18.1.3 output (CommonMark 0.31.2 + GFM). Single-pass block scanner with a delimiter-stack inline parser.","type":"module"}
