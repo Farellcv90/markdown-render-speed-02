@@ -359,9 +359,15 @@ function scanAngleAutolink(s, i) {
 }
 
 // Find the index of the ']' matching the '[' at s[start]. Skips code spans
-// and escaped brackets. Returns -1 when there is none.
-function findMatchingBracket(s, start) {
+// and escaped brackets. Returns { closeIdx, bracketFail }: closeIdx is the
+// ']' index (-1 when there is none), and bracketFail is true when a code
+// span in the text contains a backtick and is not immediately followed by
+// the closing ']' ("[a ``b`c`` d][x]" is not a link, while
+// "[a ``b`c``][x]" is). When the rule fires, the scan continues to the
+// ']' so the caller still learns where the attempted text ends.
+function findMatchingBracketInfo(s, start) {
   let depth = 0;
+  let bracketFail = false;
   let i = start + 1;
   while (i < s.length) {
     const c = s[i];
@@ -371,12 +377,22 @@ function findMatchingBracket(s, start) {
       let j = i + runLen;
       let found = -1;
       let hasInnerBacktick = false;
+      let hasBracket = false;
+      let localDepth = depth;
       // A code span's closing run must be on the same line as its
       // opener: a run on a later line belongs to a different span, so
       // a ']' before it still closes the link text ("[docs each
       // ``url`](...)" with "`` a ` b ``" on the next line is a link).
       while (j < s.length && s[j] !== '\n') {
-        if (s[j] === '`') {
+        const cj = s[j];
+        if (cj === '\\' && j + 1 < s.length && isAsciiPunct(s[j + 1])) { j += 2; continue; }
+        if (cj === '[') { localDepth++; j++; continue; }
+        if (cj === ']') {
+          if (localDepth === 0) hasBracket = true;
+          else localDepth--;
+          j++; continue;
+        }
+        if (cj === '`') {
           const r2 = countRun(s, j, '`');
           if (r2 === runLen) { found = j; break; }
           hasInnerBacktick = true;
@@ -386,8 +402,43 @@ function findMatchingBracket(s, start) {
       // A code span whose content contains a backtick (a run of a
       // different length inside it) must be immediately followed by
       // the closing ']' for the bracket to count ("[a ``b`c`` d][x]"
-      // is not a link, while "[a ``b`c``][x]" is).
-      if (found !== -1 && hasInnerBacktick && s[found + runLen] !== ']') return -1;
+      // is not a link, while "[a ``b`c``][x]" is). But when the
+      // content also holds the ']' that would close the bracket
+      // text, the span is unclosed inside the text instead: the
+      // ']' closes the text and the link may still form ("[docs
+      // each ``url`](...)" with "`` a ` b ``" later on the same
+      // line is a link). A run with no closing run of its own
+      // length may still close as a shorter run: the first
+      // backtick of "``small`" pairs with the single backtick
+      // after "small", so "[issue read two ``small`](...)" is a
+      // link, while "[not a `link](/foo`)" is not (its single
+      // backtick pairs with the one after "/foo", swallowing the
+      // ']').
+      if (found !== -1 && hasInnerBacktick && s[found + runLen] !== ']') {
+        if (hasBracket) { i += runLen; continue; }
+        bracketFail = true;
+        i = found + runLen;
+        continue;
+      }
+      if (found === -1 && runLen > 1) {
+        // No closing run of this length on the line: try a shorter
+        // run (a prefix of this one) for a closer.
+        let shortFound = -1;
+        let shortLen = 0;
+        for (let k = runLen - 1; k >= 1; k--) {
+          let m = i + runLen;
+          while (m < s.length && s[m] !== '\n') {
+            if (s[m] === '\\' && m + 1 < s.length && isAsciiPunct(s[m + 1])) { m += 2; continue; }
+            if (s[m] === '`') {
+              const r3 = countRun(s, m, '`');
+              if (r3 === k) { shortFound = m; shortLen = k; break; }
+              m += r3;
+            } else m++;
+          }
+          if (shortFound !== -1) break;
+        }
+        if (shortFound !== -1) { i = shortFound + shortLen; continue; }
+      }
       i = found === -1 ? i + runLen : found + runLen;
       continue;
     }
@@ -401,10 +452,120 @@ function findMatchingBracket(s, start) {
       if (tag) { i += tag.length; continue; }
     }
     if (c === '[') depth++;
-    else if (c === ']') { if (depth === 0) return i; depth--; }
+    else if (c === ']') { if (depth === 0) return { closeIdx: i, bracketFail }; depth--; }
     i++;
   }
+  return { closeIdx: -1, bracketFail };
+}
+
+// The plain form, for callers that only need the bracket (a failed
+// bracket rule means no matching bracket for them).
+function findMatchingBracket(s, start) {
+  const info = findMatchingBracketInfo(s, start);
+  return info.bracketFail ? -1 : info.closeIdx;
+}
+
+// Whether the link text contains a backtick run with no closing run of
+// the same length later on the same line (an unclosed code span).
+function textHasUnclosedBacktick(text) {
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === '\\' && i + 1 < text.length && isAsciiPunct(text[i + 1])) { i += 2; continue; }
+    if (text[i] === '`') {
+      const runLen = countRun(text, i, '`');
+      let j = i + runLen;
+      let found = false;
+      while (j < text.length && text[j] !== '\n') {
+        if (text[j] === '`') {
+          const r2 = countRun(text, j, '`');
+          if (r2 === runLen) { found = true; break; }
+          j += r2;
+        } else j++;
+      }
+      if (!found) return true;
+      i = j + runLen;
+      continue;
+    }
+    i++;
+  }
+  return false;
+}
+
+// Whether the text holds an unescaped '[' outside a code span (a
+// nested bracket). A failed inline link whose text holds one does not
+// suppress the emphasis inside it ("[a _x_ [b]](...)" and
+// "[a _x_ [b](...)](/uri)" keep the em, while "[a _x_](...)" with a
+// bad tail does not; a '[' inside a code span or an escaped one does
+// not count).
+function textHasRealBracket(text) {
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '\\' && i + 1 < text.length && isAsciiPunct(text[i + 1])) { i += 2; continue; }
+    if (c === '`') {
+      const runLen = countRun(text, i, '`');
+      let j = i + runLen;
+      let found = -1;
+      while (j < text.length && text[j] !== '\n') {
+        if (text[j] === '`') {
+          const r2 = countRun(text, j, '`');
+          if (r2 === runLen) { found = j; break; }
+          j += r2;
+        } else j++;
+      }
+      i = found === -1 ? i + runLen : found + runLen;
+      continue;
+    }
+    if (c === '[') return true;
+    i++;
+  }
+  return false;
+}
+
+// The start index of the last run of backticks in s at or after
+// `from` (-1 when there is none). Escaped backticks count: the span
+// an unclosed run would have closed ends at the last backtick in the
+// text, escaped or not.
+function lastBacktickRunStart(s, from) {
+  let k = s.length - 1;
+  while (k >= from) {
+    if (s[k] === '`') {
+      let start = k;
+      while (start > from && s[start - 1] === '`') start--;
+      return start;
+    }
+    k--;
+  }
   return -1;
+}
+
+// Whether the text at s[i] === '(' holds a complete parenthesised tail
+// (a ')' that balances the '('), ignoring ')' inside quotes and
+// escapes. A link whose tail is complete but invalid still counts as
+// an attempted inline link; one with no closing ')' does not.
+function hasCompleteInlineTail(s, i) {
+  let depth = 1;
+  let j = i + 1;
+  while (j < s.length) {
+    const ch = s[j];
+    if (ch === '\\' && j + 1 < s.length && isAsciiPunct(s[j + 1])) { j += 2; continue; }
+    if (ch === '"' || ch === "'") {
+      const q = ch;
+      let k = j + 1;
+      while (k < s.length && s[k] !== q) {
+        if (s[k] === '\\' && k + 1 < s.length && isAsciiPunct(s[k + 1])) k += 2;
+        else k++;
+      }
+      // An unclosed quote does not hide the ')' that closes the tail.
+      if (k >= s.length) { j++; continue; }
+      j = k + 1;
+      continue;
+    }
+    if (ch === '(') { depth++; j++; continue; }
+    if (ch === ')') { depth--; if (depth === 0) return true; j++; continue; }
+    j++;
+  }
+  return false;
 }
 
 // Parse the destination/title tail of an inline link, starting at s[i] === '('.
@@ -528,6 +689,20 @@ function trimGfmUrl(url) {
     let closes = countChar(url, ')');
     while (url.length > 0 && url[url.length - 1] === ')' &&
       (closes > opens || (closes === opens && url.length > 1 && url[url.length - 2] === ')'))) {
+      // A trailing ')' is only stripped when it is unmatched: one
+      // that closes an earlier '(' stays ("https://img.shields.io?q=1&page=2)](./docs/create.md)"
+      // keeps its final ')', because it matches the '(' of
+      // "(./docs/create.md)", and "https://example.com/a)b(c)"
+      // keeps its own). The equal-counts case still strips, as
+      // before ("https://example.com/((x))" -> "https://example.com/((x)").
+      if (closes > opens) {
+        let depth = 0;
+        for (let k = 0; k < url.length - 1; k++) {
+          if (url[k] === '(') depth++;
+          else if (url[k] === ')') { if (depth > 0) depth--; }
+        }
+        if (depth > 0) break;
+      }
       url = url.slice(0, -1);
       closes--;
     }
@@ -549,6 +724,15 @@ function inlineParse(s, refs, inLink, state) {
   const delims = [];
   let hasLink = false;
   let delimSeq = 0;
+  // Emphasis suppression from link/code-span interaction (marked
+  // masks a code span's extent when it meets a link):
+  // - suppressEnd: an index in s; '*'/'_'/'~' runs before it make no
+  //   delimiter. A failed inline link attempt leaves the emphasis
+  //   inside its attempted text literal (suppressEnd is the text's
+  //   closing ']'); a link whose text holds an unclosed backtick run
+  //   suppresses emphasis up to the last backtick run after the link
+  //   (the span the unclosed run would have closed).
+  let suppressEnd = -1;
 
   // Whether the character after an email match ends the address. A
   // trailing '-' always invalidates it; a trailing '_' does too,
@@ -679,6 +863,15 @@ function inlineParse(s, refs, inLink, state) {
     }
     if (c === '*' || c === '_' || c === '~') {
       const runLen = countRun(s, i, c);
+      // Suppressed emphasis (a failed inline link's text, or the
+      // stretch after a link whose text holds an unclosed backtick
+      // run, up to the last backtick run after the link) stays
+      // literal text: no delimiter is created.
+      if (i < suppressEnd) {
+        pushText(s.slice(i, i + runLen));
+        i += runLen;
+        continue;
+      }
       const before = i > 0 ? s[i - 1] : '';
       const after = i + runLen < n ? s[i + runLen] : '';
       // The start and end of the string count as whitespace for the
@@ -771,14 +964,47 @@ function inlineParse(s, refs, inLink, state) {
     if (c === '[' || (c === '!' && s[i + 1] === '[')) {
       const isImage = c === '!';
       const start = isImage ? i + 1 : i;
-      const closeIdx = findMatchingBracket(s, start);
-      if (closeIdx !== -1) {
+      const info = findMatchingBracketInfo(s, start);
+      const closeIdx = info.closeIdx;
+      if (closeIdx !== -1 && !info.bracketFail) {
         const res = tryLink(start, closeIdx, isImage);
         if (res) {
           pushHtml(res.html, res.plain);
           if (res.isLink) hasLink = true;
+          // A link whose text holds an unclosed backtick run
+          // suppresses emphasis after it up to the last backtick
+          // run after the link (the span the unclosed run would
+          // have closed); with no backtick after the link there is
+          // no suppression ("[docs each ``url`](...)" leaves a
+          // following "_issue table_" literal until "`` a ` b ``",
+          // but not when no backtick follows).
+          if (textHasUnclosedBacktick(s.slice(start + 1, closeIdx))) {
+            const lastBt = lastBacktickRunStart(s, res.end);
+            if (lastBt !== -1 && lastBt > suppressEnd) suppressEnd = lastBt;
+          }
           i = res.end;
           continue;
+        }
+        // A failed inline link attempt (a complete "(...)" tail
+        // follows but the destination, title or angle is bad)
+        // leaves the emphasis inside its attempted text literal --
+        // unless the text holds a nested bracket ("[a _x_](bad
+        // dest)" keeps "_x_" literal, while "[a _x_ [b]](bad
+        // dest)" and "[foo *[bar [baz](/uri)](/uri)*](/uri)" keep
+        // the emphasis).
+        if (s[closeIdx + 1] === '(' && hasCompleteInlineTail(s, closeIdx + 1) &&
+          !textHasRealBracket(s.slice(start + 1, closeIdx))) {
+          if (closeIdx > suppressEnd) suppressEnd = closeIdx;
+        }
+      } else if (closeIdx !== -1) {
+        // The bracket rule failed (a code span in the text holds a
+        // backtick and is not followed by ']'): the same failed
+        // inline link attempt suppresses the emphasis inside the
+        // attempted text, again unless the text holds a nested
+        // bracket.
+        if (s[closeIdx + 1] === '(' && hasCompleteInlineTail(s, closeIdx + 1) &&
+          !textHasRealBracket(s.slice(start + 1, closeIdx))) {
+          if (closeIdx > suppressEnd) suppressEnd = closeIdx;
         }
       }
       pushText(c);
@@ -866,14 +1092,24 @@ function inlineParse(s, refs, inLink, state) {
   }
 
   // Resolve emphasis / strong / strikethrough with the delimiter stack.
-  function makeEmphasis(opener, closer, use) {
+  // openerFromStart: the opener consumes the FIRST `use` chars of its
+  // run (the excess stays inside the emphasis) instead of the last
+  // (the excess stays outside). Used for matches allowed only by the
+  // closer-length escape (see the openers_bottom rule below), where
+  // marked takes the outermost delimiters of both runs.
+  function makeEmphasis(opener, closer, use, openerFromStart) {
     const tag = opener.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
     const closerAfter = splitTextNode(closer.node, closer.off);
-    const openerAfter = splitTextNode(opener.node, opener.off + opener.len - use);
+    const openerAfter = splitTextNode(opener.node, openerFromStart ? opener.off : opener.off + opener.len - use);
     openerAfter.s = openerAfter.s.slice(use);
     closerAfter.s = closerAfter.s.slice(use);
     for (const d of delims) {
       if (d.node === closerAfter && d.off > 0) d.off -= use;
+    }
+    if (openerFromStart) {
+      for (const d of delims) {
+        if (d.node === openerAfter && d.off > 0) d.off -= use;
+      }
     }
     const oi = nodes.indexOf(openerAfter);
     const ci = nodes.indexOf(closerAfter);
@@ -897,19 +1133,38 @@ function inlineParse(s, refs, inLink, state) {
   // the matched opener's sequence number, and it is only set when
   // that opener was not itself a failed closer ("*foo**bar**baz*"
   // still forms the outer em, and "**foo*bar*baz**" the outer
-  // strong). A closer that fails after an odd-match skip clears the
+  // strong). The bottom has a flavour: set by an em match it blocks
+  // everything except a match that fully consumes a one-character
+  // opener ("*uses state *callback*markdown**" still forms the outer
+  // em, while "**a *b*c**" leaves both '**' literal); set by a
+  // strong match it blocks everything except a strong match
+  // ("**line **same**private**" forms the outer strong, while
+  // "*a **b**c**" does not form the outer em). Either flavour is
+  // escaped when the closer run has at least 3 delimiters
+  // ("**return that *old*two***" and "*a **b**c***" both form, while
+  // "**a *b*c**" and "*a **b**c**" do not); a match allowed only by
+  // that escape consumes the outermost delimiters of both runs, so
+  // the excess stays inside ("***a *b*c***" ->
+  // "<em>**a <em>b</em>c**</em>"). It is only set when
+  // the closer run is fully consumed: the remainder of a partly used
+  // run ("*then is **next type when (x)***.") may still match an
+  // opener before it. A closer that fails after an odd-match skip clears the
   // bottom ("*a **b**c** d*" closes at the last '*').
   const openersBottom = { '*': -1, '_': -1, '~': -1 };
+  const bottomStrong = { '*': false, '_': false, '~': false };
   // Whether any delimiter was marked failed as a closer (used by the
-  // closer-consumption rule below), and whether the closer of the
-  // most recent emphasis match could open.
+  // closer-consumption rule below), whether the closer of the
+  // most recent emphasis match could open, and that match's use (1
+  // for em, 2 for strong).
   let sawFailed = false;
   let lastCloserCanOpen = false;
+  let lastMatchUse = 0;
   while (di < delims.length) {
     const closer = delims[di];
     if (!closer.canClose) { di++; continue; }
     let opener = null;
     let skippedOdd = false;
+    let viaExcess = false;
     for (let j = di - 1; j >= 0; j--) {
       const cand = delims[j];
       if (cand.ch !== closer.ch || !cand.canOpen) continue;
@@ -930,15 +1185,22 @@ function inlineParse(s, refs, inLink, state) {
         !((cand.len % 3 === 0) && (closer.len % 3 === 0));
       if (eitherBoth && sum3) { skippedOdd = true; continue; }
       // openers_bottom: an opener strictly before the bottom cannot
-      // be used -- unless the match would be a strong (both lengths
-      // >= 2, which ignores the bottom: "**line **same**private**"
-      // forms the outer strong, while "*a **b** c**" does not form
-      // the outer em), or the lengths sum to a multiple of 3, which
-      // clears the bottom instead.
-      if (cand.seq < openersBottom[closer.ch] && !(cand.len >= 2 && closer.len >= 2)) {
-        if (sum3) { openersBottom[closer.ch] = -1; continue; }
+      // be used -- unless the bottom was set by a strong match and
+      // this match would be a strong (both lengths >= 2), or the
+      // bottom was set by an em match and this match would fully
+      // consume a one-character opener; or the closer run has at
+      // least 3 delimiters, which escapes either flavour; or the
+      // lengths sum to a multiple of 3, which clears the bottom
+      // instead.
+      const primaryAllows = bottomStrong[closer.ch]
+        ? (cand.len >= 2 && closer.len >= 2)
+        : cand.len === 1;
+      const escapeAllows = closer.len >= 3;
+      if (cand.seq < openersBottom[closer.ch] && !primaryAllows && !escapeAllows) {
+        if (sum3) { openersBottom[closer.ch] = -1; bottomStrong[closer.ch] = false; continue; }
         break;
       }
+      if (cand.seq < openersBottom[closer.ch] && !primaryAllows) viaExcess = true;
       opener = cand;
       break;
     }
@@ -951,40 +1213,55 @@ function inlineParse(s, refs, inLink, state) {
         closer.failed = true;
         sawFailed = true;
         openersBottom[closer.ch] = -1;
+        bottomStrong[closer.ch] = false;
       }
       di++;
       continue;
     }
     const use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
-    // The bottom is set only on a strong match (use 2): an em match
-    // does not block a later closer ("*uses state *callback*markdown**"
-    // still forms the outer em).
-    if (closer.canOpen && !opener.failed && use === 2) openersBottom[closer.ch] = opener.seq;
+    // The bottom is set on any match whose closer can open and is
+    // fully consumed by the match -- an em match sets the em-flavoured
+    // bottom, a strong match the strong-flavoured one. A partly used
+    // closer run sets no bottom: its remainder may still match an
+    // opener before the matched one.
+    if (closer.canOpen && !opener.failed && closer.len === use) {
+      openersBottom[closer.ch] = opener.seq;
+      bottomStrong[closer.ch] = use === 2;
+    }
     // Closer consumption: a closer normally consumes from the start
     // of its run (the excess stays outside: "*ab**" -> "<em>ab</em>*",
     // "**foo***" -> "<strong>foo</strong>*"). It consumes from the
-    // end (the excess stays inside the emphasis) when the opener is
-    // fully used, the closer has exactly one excess delimiter, no
-    // other opener remains for that excess to pair with, and either
-    // a delimiter failed earlier ("*foo**bar**" ->
-    // "<em>foo**bar*</em>") or the match is a strong and the closer
-    // of the previous match could open ("**return that *old*two***"
-    // -> "<strong>return that <em>old</em>two*</strong>", while
-    // "**a *b* c***" keeps the excess outside).
-    if (opener.len === use && closer.len - use === 1 && (sawFailed || (use === 2 && lastCloserCanOpen))) {
+    // end (the excess stays inside the emphasis) when no other
+    // opener remains for that excess to pair with and either the
+    // match was allowed only by the closer-length escape (which
+    // also takes the opener from the start of its run, so the
+    // opener's excess stays inside too: "***a *b*c***" ->
+    // "<em>**a <em>b</em>c**</em>"), or the opener is fully used,
+    // the closer has exactly one excess delimiter, and either a
+    // delimiter failed earlier ("*foo**bar**" ->
+    // "<em>foo**bar*</em>") or the match is a strong, the previous
+    // match was an em, and its closer could open
+    // ("**return that *old*two***" ->
+    // "<strong>return that <em>old</em>two*</strong>", while
+    // "**a *b* c***" and "**a **b**c***" keep the excess outside).
+    const excess = closer.len - use;
+    const fromEnd = viaExcess ||
+      (opener.len === use && excess === 1 && (sawFailed || (use === 2 && lastCloserCanOpen && lastMatchUse === 1)));
+    if (excess >= 1 && fromEnd) {
       const cIdx = delims.indexOf(closer);
       let hasOpener = false;
       for (let k = 0; k < cIdx; k++) {
         if (delims[k] !== opener && delims[k].canOpen && !delims[k].failed) { hasOpener = true; break; }
       }
       if (!hasOpener) {
-        closer.off += closer.len - use;
+        closer.off += excess;
         closer.len = use;
       }
     }
     const oIdx = delims.indexOf(opener);
-    makeEmphasis(opener, closer, use);
+    makeEmphasis(opener, closer, use, viaExcess);
     lastCloserCanOpen = closer.canOpen;
+    lastMatchUse = use;
     // Restart the scan at the opener (or where it was): the match
     // removed delimiters, so the old index is stale. Re-examining
     // from the opener lets a remaining opener or closer match again
@@ -1003,14 +1280,17 @@ function inlineParse(s, refs, inLink, state) {
 // A cursor over one source line, tracking a virtual column so tabs expand
 // the way CommonMark measures them (width 4 - col % 4). A partially
 // consumed tab leaves its remaining columns as virtual spaces (pend).
-function makeCursor(line) { return { s: line, i: 0, col: 0, pend: 0 }; }
+function makeCursor(line) { return { s: line, i: 0, col: 0, pend: 0, sub: 0, msub: 0 }; }
 function curPeek(cur) {
   if (cur.pend > 0) return ' ';
   return cur.i < cur.s.length ? cur.s[cur.i] : '';
 }
 function curWidth(cur) {
   if (cur.pend > 0) return 1;
-  return cur.s[cur.i] === '\t' ? 4 - (cur.col % 4) : 1;
+  // Tab stops are measured from the column where the deepest container
+  // started (cur.sub), not from the line start: a tab after "> " inside
+  // a list item is 2 columns wide, not 4.
+  return cur.s[cur.i] === '\t' ? 4 - ((cur.col - cur.sub) % 4) : 1;
 }
 function curAdvance(cur, n) {
   while (n > 0) {
@@ -1038,7 +1318,7 @@ function curIndent(cur) {
     if (pend > 0) { col++; pend--; if (pend === 0) i++; continue; }
     const ch = cur.s[i];
     if (ch === ' ') { col++; i++; continue; }
-    if (ch === '\t') { col += 4 - (col % 4); i++; continue; }
+    if (ch === '\t') { col += 4 - ((col - cur.sub) % 4); i++; continue; }
     break;
   }
   return col - cur.col;
@@ -1056,7 +1336,7 @@ function lineContent(cur, expandLead) {
     if (pend > 0) { lead++; col++; pend--; if (pend === 0) i++; continue; }
     const ch = cur.s[i];
     if (ch === ' ') { lead++; col++; i++; continue; }
-    if (ch === '\t') { const w = 4 - (col % 4); lead += w; col += w; i++; continue; }
+    if (ch === '\t') { const w = 4 - ((col - cur.sub) % 4); lead += w; col += w; i++; continue; }
     break;
   }
   return ' '.repeat(lead) + cur.s.slice(i);
@@ -1477,10 +1757,14 @@ function blockParse(src) {
         break;
       }
     }
-    const savedCol = cur.col;
-    if (subtract > 0) cur.col = Math.max(0, cur.col - subtract);
+    // The fence's own subtract now sets the tab origin (cur.sub) for
+    // this line instead of shifting cur.col: the widths lineContent
+    // computes are the same, and a tab partly consumed while matching
+    // a quote keeps the width it was measured with.
+    const savedSub = cur.sub;
+    cur.sub = subtract <= cur.col ? subtract : cur.col;
     leaf.lines.push(lineContent(cur, expandLead));
-    cur.col = savedCol;
+    cur.sub = savedSub;
     leaf.lastLine = li;
   }
 
@@ -1602,6 +1886,11 @@ function blockParse(src) {
       inner.children.push(quote);
       stack.push(quote);
       cur.i++; cur.col++;
+      // Tabs after a new quote marker are measured from the columns
+      // the containers above it stripped (cur.msub), not from the
+      // quote's own column: "  > \tfoo" inside an item is 2 spaces,
+      // while "   > \tfoo" at the root is 3.
+      cur.sub = cur.msub;
       if (cur.s[cur.i] === ' ' || cur.s[cur.i] === '\t') curAdvance(cur, 1);
       const rest = lineContent(cur, true);
       return startBlockRest(cur, rest, li, pendingBlankStack);
@@ -1661,13 +1950,16 @@ function blockParse(src) {
     if (ch === '-' || ch === '+' || ch === '*') {
       const after = s[i + 1];
       if (after !== undefined && after !== ' ' && after !== '\t') return null;
-      // Columns of whitespace after the marker (capped at 5).
+      // Columns of whitespace after the marker (capped at 5). Tab
+      // stops here are measured from the columns the containers
+      // stripped (cur.msub): "- a\n  - \tfoo" has a 2-wide tab, while
+      // the same line at the root has a 4-wide one.
       let col = startCol + 1;
       let j = i + 1;
       let ws = 0;
       while (j < s.length && ws < 5) {
         if (s[j] === ' ') { ws++; col++; j++; continue; }
-        if (s[j] === '\t') { const w = 4 - (col % 4); ws += w; col += w; j++; continue; }
+        if (s[j] === '\t') { const w = 4 - ((col - cur.msub) % 4); ws += w; col += w; j++; continue; }
         break;
       }
       return { bullet: true, marker: ch, markerWidth: 1, ws, start: null, empty: j >= s.length };
@@ -1687,7 +1979,7 @@ function blockParse(src) {
       let ws = 0;
       while (k < s.length && ws < 5) {
         if (s[k] === ' ') { ws++; col++; k++; continue; }
-        if (s[k] === '\t') { const w = 4 - (col % 4); ws += w; col += w; k++; continue; }
+        if (s[k] === '\t') { const w = 4 - ((col - cur.msub) % 4); ws += w; col += w; k++; continue; }
         break;
       }
       return { bullet: false, marker: delim, markerWidth: digits + 1, ws, start: num, empty: k >= s.length };
@@ -1736,7 +2028,11 @@ function blockParse(src) {
     const item = { type: 'item', contentIndent: indent + advance, children: [], open: true };
     list.children.push(item);
     stack.push(item);
-    // Position the cursor at the item's content start.
+    // Position the cursor at the item's content start. The marker's
+    // whitespace was measured from cur.msub, so advance with that
+    // origin too, or a tab is consumed by a different width than it
+    // was measured with.
+    cur.sub = cur.msub;
     curAdvance(cur, advance);
     const rest = lineContent(cur, true);
     if (trimLine(rest) === '') return 'list';
@@ -1838,8 +2134,15 @@ function blockParse(src) {
     let colBeforeDeepest = 0;
     let quoteColsTotal = 0;
     let innermostQuoteCols = 0;
+    // Column where the deepest container that matched started: tab
+    // stops for the leaf's content are measured from there.
+    let deepStart = 0;
     for (let si = 1; si < stack.length; si++) {
       if (si === stack.length - 1) colBeforeDeepest = cur.col;
+      // Each container measures the tabs in its own prefix from the
+      // column where that container started.
+      const startCol = cur.col;
+      cur.sub = startCol;
       const c = stack[si];
       if (c.type === 'quote') {
         const saved = { i: cur.i, col: cur.col, pend: cur.pend };
@@ -1852,32 +2155,41 @@ function blockParse(src) {
           quoteColsTotal += qCols;
           innermostQuoteCols = qCols;
           matchedDepth = si + 1;
+          deepStart = startCol;
           continue;
         }
         cur.i = saved.i; cur.col = saved.col; cur.pend = saved.pend;
         failIdx = si;
         break;
       } else if (c.type === 'item') {
-        if (blank) { matchedDepth = si + 1; continue; }
+        if (blank) { matchedDepth = si + 1; deepStart = startCol; continue; }
         // A line with nothing after the container prefixes (">>") is
         // blank at this level: the item matches it, so a following
         // indented line can still join the item instead of the item
         // being closed by the blank line.
         let k = cur.i, restBlank = true;
         while (k < cur.s.length) { if (cur.s[k] !== ' ' && cur.s[k] !== '\t') { restBlank = false; break; } k++; }
-        if (restBlank) { matchedDepth = si + 1; continue; }
+        if (restBlank) { matchedDepth = si + 1; deepStart = startCol; continue; }
         if (curIndent(cur) >= c.contentIndent) {
           curAdvance(cur, c.contentIndent);
           matchedDepth = si + 1;
+          deepStart = startCol;
           continue;
         }
         failIdx = si;
         break;
       } else {
         matchedDepth = si + 1;
+        deepStart = startCol;
         continue;
       }
     }
+    // Leaf content measures its tabs from where the deepest matched
+    // container started (not from where a container that failed did).
+    // Tabs after a NEW container's marker are measured from the columns
+    // the containers stripped (cur.msub) instead: see startBlock.
+    cur.sub = deepStart;
+    cur.msub = cur.col;
     const allMatched = failIdx === -1;
     const inner = stack[matchedDepth - 1];
     let leaf = openLeafOf(inner);
@@ -2066,7 +2378,10 @@ function blockParse(src) {
       const para = deepestParagraph(stack[failIdx]);
       if (para && !interruptsParagraph(cur, true)) {
         if (curIndent(cur) >= 4) curAdvance(cur, 4);
-        let content = lineContent(cur, false);
+        // A lazy line's leading tab expands at its effective column
+        // (measured from the deepest matched container), like a
+        // matched line's does; spaces are unaffected.
+        let content = lineContent(cur, true);
         // A lazy line shaped like a setext underline ("===") is not an
         // underline at all: it joins the paragraph. When the paragraph's
         // previous line was itself lazy and the failing container is a
@@ -2109,7 +2424,12 @@ function blockParse(src) {
         }
         cur.i = saved.i; cur.col = saved.col; cur.pend = saved.pend;
       }
-      if (setextLevel > 0 && !getDefsOnly()) {
+      // A paragraph that will finalize as a GFM table is not a
+      // setext heading: an '=' line is a table body row (it joins
+      // the paragraph), and a '-' line falls through to the
+      // thematic-break/list handling below ('---' ends the table
+      // with an <hr>, '-' and '--' join it as rows).
+      if (setextLevel > 0 && !getDefsOnly() && !paragraphIsTable(curLeaf.lines)) {
         const rest = commitDefs(paraText);
         let t = rest;
         let a = 0;
@@ -2144,7 +2464,11 @@ function blockParse(src) {
         }
       }
       let content = lineContent(cur, expandLead);
-      if (stack.slice(0, matchedDepth).some(c => c.type === 'item')) {
+      // Four leading spaces are stripped only when the paragraph sits
+      // directly in a list item (its code-indent compensation); a
+      // paragraph inside a quote keeps them ("  > foo\n  >     bar"
+      // keeps all four spaces).
+      if (parent.type === 'item') {
         let sp = 0;
         while (sp < content.length && content[sp] === ' ') sp++;
         if (sp >= 4) content = content.slice(4);
