@@ -229,12 +229,13 @@ function isValidLabel(raw) {
 function renderNodes(nodes) {
   let out = '';
   for (const nd of nodes) {
+    const t = nd.t;
     // Text nodes are escaped strictly: any '&' in them is a literal
     // character (from a backslash escape or a decoded numeric reference)
     // and must become &amp;. A reference that looks like an entity is
     // never stored as text -- the scanner emits it as a raw node instead.
-    if (nd.t === 'x') out += escapeHtmlStrict(nd.s);
-    else if (nd.t === 'h') out += nd.s;
+    if (t === 'x') out += escapeHtmlStrict(nd.s);
+    else if (t === 'h') out += nd.s;
     else out += '<' + nd.tag + '>' + renderNodes(nd.kids) + '</' + nd.tag + '>';
   }
   return out;
@@ -242,8 +243,9 @@ function renderNodes(nodes) {
 function plainNodes(nodes) {
   let out = '';
   for (const nd of nodes) {
-    if (nd.t === 'x') out += nd.s;
-    else if (nd.t === 'h') out += nd.plain || '';
+    const t = nd.t;
+    if (t === 'x') out += nd.s;
+    else if (t === 'h') out += nd.plain || '';
     else out += plainNodes(nd.kids);
   }
   return out;
