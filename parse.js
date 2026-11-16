@@ -223,7 +223,7 @@ function scanCodeClose(s, from, run) {
 // ']' that ends the text, or -1. `depth` is the bracket nesting depth of the
 // current text (0 for a link's text, 1 inside a group, ...). Groups nest at
 // most two deep.
-function scanTextInner(s, i, depth) {
+function scanTextInner(s, i, depth, info) {
   const n = s.length;
   // Code-span state for this bracket level: `spanLen` is the length of the
   // run that opened the current span (0 = outside a span), `spanEnd` the
@@ -249,6 +249,7 @@ function scanTextInner(s, i, depth) {
       if (c === 96) {
         let j = i;
         while (j < n && s.charCodeAt(j) === 96) j++;
+        if (info && j - i !== spanLen) info.mismatched = true;
         spanLen = 0; spanEnd = -1;
         i = j;
         continue;
@@ -269,7 +270,7 @@ function scanTextInner(s, i, depth) {
     }
     if (c === 91) { // [ starts a nested group
       if (depth >= 2) return -1;
-      const g = scanTextInner(s, i + 1, depth + 1);
+      const g = scanTextInner(s, i + 1, depth + 1, info);
       if (g === -1) return -1;
       i = g + 1;
       continue;
@@ -315,6 +316,67 @@ function textBalanced(raw) {
     i++;
   }
   return depth === 0;
+}
+
+// Index of the ')' matching the '(' at s[i], or -1. The group is complete
+// when a balanced ')' exists, regardless of whether the destination or
+// title inside is valid. Handles an angle destination at the start and
+// quoted titles (a ')' inside either does not close the group).
+function parenClose(s, i) {
+  const n = s.length;
+  let depth = 1, q = i + 1;
+  while (q < n && (s.charCodeAt(q) === 32 || s.charCodeAt(q) === 9 || s.charCodeAt(q) === 10)) q++;
+  if (q < n && s.charCodeAt(q) === 60) { // <...> angle destination
+    q++;
+    let ok = false;
+    while (q < n) {
+      const c = s.charCodeAt(q);
+      if (c === 10 || c === 60) return -1;
+      if (c === 62) { ok = true; break; }
+      if (c === 92 && q + 1 < n) q += 2; else q++;
+    }
+    if (!ok) return -1;
+    q++;
+  }
+  while (q < n) {
+    const c = s.charCodeAt(q);
+    if (c === 92 && q + 1 < n) { q += 2; continue; }
+    if ((c === 34 || c === 39) && q > 0 &&
+      (s.charCodeAt(q - 1) === 32 || s.charCodeAt(q - 1) === 9 || s.charCodeAt(q - 1) === 10)) {
+      // quoted title (only in title position, after whitespace)
+      const qc = c; q++;
+      let ok = false;
+      while (q < n) {
+        const d = s.charCodeAt(q);
+        if (d === 92 && q + 1 < n) { q += 2; continue; }
+        if (d === qc) { ok = true; break; }
+        q++;
+      }
+      if (!ok) return -1;
+      q++;
+      continue;
+    }
+    if (c === 40) depth++;
+    else if (c === 41) { depth--; if (depth === 0) return q; }
+    q++;
+  }
+  return -1;
+}
+
+// First ']' at bracket-depth 0 from s[ts], ignoring backticks and
+// respecting backslash escapes. Locates the would-be label end when the
+// backtick-aware label scan fails.
+function plainClose(s, ts) {
+  const n = s.length;
+  let depth = 0, i = ts;
+  while (i < n) {
+    const c = s.charCodeAt(i);
+    if (c === 92) { i += (i + 1 < n) ? 2 : 1; continue; }
+    if (c === 91) { depth++; i++; continue; }
+    if (c === 93) { if (depth === 0) return i; depth--; i++; continue; }
+    i++;
+  }
+  return -1;
 }
 
 function skipWsNl(s, i) {
@@ -789,9 +851,44 @@ function truncateTail(nodes, delims, text, count) {
   return text;
 }
 
+// Global exact-length backtick pairing over the raw inline source.
+// Returns [openerStart, closerStart] spans. A run pairs with the next run
+// of the same length; runs between them are consumed (they cannot pair
+// themselves). An escaped backtick run (odd number of backslashes before
+// it) cannot OPEN a span, but it can CLOSE one.
+function codeSpanRanges(s) {
+  const n = s.length;
+  const runs = [];
+  let i = 0;
+  while (i < n) {
+    if (s.charCodeAt(i) === 96) {
+      let j = i;
+      while (j < n && s.charCodeAt(j) === 96) j++;
+      let bs = 0;
+      for (let q = i - 1; q >= 0 && s.charCodeAt(q) === 92; q--) bs++;
+      runs.push([i, j - i, bs % 2 === 1]);
+      i = j;
+    } else i++;
+  }
+  const spans = [];
+  let r = 0;
+  while (r < runs.length) {
+    if (runs[r][2]) { r++; continue; } // escaped runs cannot open
+    const len = runs[r][1];
+    let q = r + 1;
+    while (q < runs.length && runs[q][1] !== len) q++;
+    if (q < runs.length) { spans.push([runs[r][0], runs[q][0]]); r = q + 1; }
+    else r++;
+  }
+  return spans;
+}
+
 function parseInline(s, refs, noAuto) {
   const nodes = [];
   const delims = [];
+  const spanRanges = codeSpanRanges(s);
+  const suppRegions = []; // [start, end] label ranges of failed links/images
+  // whose inner emphasis is suppressed (Rule B)
   let text = '';
   let prevKind = 'start'; // start | text | entity | escape | nontext
   const n = s.length;
@@ -926,15 +1023,18 @@ function parseInline(s, refs, noAuto) {
     if (c === 91 || (c === 33 && i + 1 < n && s.charCodeAt(i + 1) === 91)) {
       const img = c === 33;
       const ts = i + (img ? 2 : 1);
-      const closeIdx = scanTextInner(s, ts, 0);
+      const scanInfo = { mismatched: false };
+      const closeIdx = scanTextInner(s, ts, 0, scanInfo);
       let done = false;
       if (closeIdx !== -1) {
         const textSrc = s.slice(ts, closeIdx);
         const after = closeIdx + 1;
         let dest = null;
+        let inlineDestBad = false;
         if (after < n && s.charCodeAt(after) === 40) {
           dest = parseInlineDest(s, after);
           if (!dest) {
+            inlineDestBad = true;
             // A failed inline destination falls back to the shortcut
             // reference link.
             const ref = refs.get(normalizeLabel(textSrc));
@@ -972,6 +1072,20 @@ function parseInline(s, refs, noAuto) {
           i = dest.end;
           done = true;
         }
+        // Rule B (T1): the label scanned, an inline destination was
+        // attempted but invalid, and the paren group is complete: the
+        // link fails and emphasis fully inside the label is suppressed.
+        if (!done && inlineDestBad && parenClose(s, after) !== -1) {
+          suppRegions.push([ts, closeIdx]);
+        }
+      } else if (scanInfo.mismatched) {
+        // Rule B (T2): the label scan failed after consuming a mismatched
+        // backtick pair, and a complete ]( ... ) follows the would-be ']':
+        // emphasis fully inside the would-be label is suppressed.
+        const pc = plainClose(s, ts);
+        if (pc !== -1 && pc + 1 < n && s.charCodeAt(pc + 1) === 40 && parenClose(s, pc + 1) !== -1) {
+          suppRegions.push([ts, pc]);
+        }
       }
       if (!done) {
         pushText(img ? '![' : '[', 'text');
@@ -1001,6 +1115,14 @@ function parseInline(s, refs, noAuto) {
       } else {
         canOpen = leftFl;
         canClose = rightFl;
+      }
+      // A delimiter whose position lies strictly inside a global
+      // exact-pairing backtick span cannot close (the span's content is
+      // code, not emphasis); it may still open.
+      if (canClose && spanRanges.length) {
+        for (let sr = 0; sr < spanRanges.length; sr++) {
+          if (i > spanRanges[sr][0] && i < spanRanges[sr][1]) { canClose = false; break; }
+        }
       }
       flushText();
       const nd = { k: 7, ch: String.fromCharCode(c), n: run, o: canOpen, c: canClose, pos: i, nw: nextCh !== undefined && !nextWs && !nextPunct };
@@ -1069,7 +1191,7 @@ function parseInline(s, refs, noAuto) {
     i++;
   }
   flushText();
-  processEmphasis(nodes, delims);
+  processEmphasis(nodes, delims, suppRegions);
   return nodes;
 }
 
@@ -1079,7 +1201,7 @@ function parseInline(s, refs, noAuto) {
 // an opener before that pair whose run length differs from the inner
 // opener's (e.g. in `*a **b**c*` the outer `*...*` stays literal, while
 // in `**a **b**c**` it still forms). The floor is one-time.
-function processEmphasis(nodes, delims) {
+function processEmphasis(nodes, delims, suppRegions) {
   // delims is in document order. Work with indices into it.
   let floorPos = -1, floorLen = 0, floorCh = '';
   let ci = 0;
@@ -1092,7 +1214,26 @@ function processEmphasis(nodes, delims) {
     while (oi >= 0) {
       const cand = delims[oi];
       if (cand.n > 0 && cand.o && cand.ch === closer.ch) {
-        if (floorPos !== -1 && floorCh === closer.ch && cand.pos < floorPos && cand.n !== floorLen) break;
+        // Rule B: a pair fully inside a failed-link suppression region
+        // does not form; keep looking at earlier openers.
+        if (suppRegions && suppRegions.length) {
+          let inReg = false;
+          for (let ri = 0; ri < suppRegions.length; ri++) {
+            const rs = suppRegions[ri][0], re = suppRegions[ri][1];
+            if (cand.pos >= rs && cand.pos < re && closer.pos >= rs && closer.pos < re) { inReg = true; break; }
+          }
+          if (inReg) { oi--; continue; }
+        }
+        // Floor: after an inner pair whose closer is followed by a word
+        // character, a later closer cannot use an opener before the inner
+        // pair for a weaker emphasis (use < floorLen), nor for an em
+        // (use 1) that would leave part of the opener unused; a strong
+        // pair (use 2) of at least the floor's strength may cross it.
+        // Skip such an opener and try an earlier one.
+        if (floorPos !== -1 && floorCh === closer.ch && cand.pos < floorPos) {
+          const useLen = (cand.n >= 2 && closer.n >= 2) ? 2 : 1;
+          if (useLen < floorLen || (useLen === 1 && cand.n > useLen)) { oi--; continue; }
+        }
         // Tildes pair only with a run of the same length.
         if (closer.ch === '~' && cand.n !== closer.n) { oi--; continue; }
         const odd = (cand.c || closer.o) &&
@@ -1104,7 +1245,19 @@ function processEmphasis(nodes, delims) {
       }
       oi--;
     }
-    if (!opener) { if (floorPos !== -1 && floorCh === closer.ch) { floorPos = -1; floorLen = 0; floorCh = ''; } ci++; continue; }
+    if (!opener) {
+      if (closer._em && closer.n > 0) {
+        // Unpaired strong-closer leftover: it is content inside its
+        // strong node, not a literal after it.
+        const ni = nodes.indexOf(closer);
+        if (ni !== -1) nodes.splice(ni, 1);
+        closer._em.ch.push(closer);
+        closer._em = undefined;
+        delims.splice(ci, 1);
+        continue; // ci now points at the next delimiter
+      }
+      ci++; continue;
+    }
     const use = (opener.n >= 2 && closer.n >= 2) ? 2 : 1;
     const tag = closer.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
     // locate opener and closer in the nodes array
@@ -1120,6 +1273,13 @@ function processEmphasis(nodes, delims) {
     repl.push(emNode);
     if (closer.n > 0) repl.push(closer);
     nodes.splice(oIdx, cIdx - oIdx + 1, ...repl);
+    // A strong pair (use 2) takes the LAST two markers of the closer run;
+    // if the closer's leftover never pairs with an earlier opener, it is
+    // content inside the strong node — but only when a floor is active
+    // (the inner pair's closer was followed by a word character); without
+    // a floor the leftover stays a literal after the node.
+    closer._em = (use === 2 && closer.n > 0 && floorPos !== -1 && floorCh === closer.ch) ? emNode : undefined;
+    opener._em = undefined;
     // Delimiters strictly between opener and closer in document order now
     // sit inside the emphasis node: drop them from the top-level list.
     // (oi and ci are their indices in the delims array.)
