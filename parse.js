@@ -449,6 +449,21 @@ function plainText(children, out) {
   }
 }
 
+// Replace autolink nodes (`link` with auto:true) in `children` by their
+// plain text, in place. Used when a bracket link forms around them: an
+// autolink inside a link's text renders as text, not as a nested <a>.
+function flattenAutolinks(children) {
+  for (let k = 0; k < children.length; k++) {
+    const n = children[k];
+    if (n.t === 'link' && n.auto) {
+      const text = n.c && n.c.length > 0 ? n.c.map((x) => x.s || '').join('') : '';
+      children.splice(k, 1, { t: 'text', s: text });
+    } else if (n.c) {
+      flattenAutolinks(n.c);
+    }
+  }
+}
+
 // Resolve emphasis/del delimiters within one container's children.
 // delims: [{ch, n, canOpen, canClose, node, active}] in document order.
 function resolveEmphasis(children, delims) {
@@ -661,7 +676,6 @@ const INLINE_SPECIAL = new Uint8Array(128);
 for (const ch of '\\`*_~[]!<&\n') INLINE_SPECIAL[ch.charCodeAt(0)] = 1;
 INLINE_SPECIAL[119] = 1; // w (www.)
 INLINE_SPECIAL[104] = 1; // h (http://, https://)
-INLINE_SPECIAL[87] = 1; // W (WWW.)
 INLINE_SPECIAL[72] = 1; // H (HTTP://, HTTPS://)
 INLINE_SPECIAL[64] = 1; // @ (e-mail autolink)
 
@@ -893,7 +907,8 @@ function trimGfmUrl(s, start, end) {
 function scanGfmAutolink(s, i) {
   const n = s.length;
   // www. — must not be preceded by a word character, / or =
-  if (s.slice(i, i + 4).toLowerCase() === 'www.') {
+  // (lowercase only: Www. is not an autolink)
+  if (s.startsWith('www.', i)) {
     if (i > 0) {
       const p = s.charCodeAt(i - 1);
       if (isAlnumCode(p) || p === 47 || p === 61 || p === 46) return null;
@@ -901,7 +916,7 @@ function scanGfmAutolink(s, i) {
     let e = i + 4;
     while (e < n) {
       const c = s.charCodeAt(e);
-      if (c === 32 || c === 10 || c === 9 || c === 60 || c < 32) break;
+      if (c === 32 || c === 10 || c === 9 || c === 60 || c === 93 || c < 32) break;
       e++;
     }
     if (e === i + 4) return null;
@@ -934,7 +949,8 @@ function scanGfmAutolink(s, i) {
     let e = i + schemeLen;
     while (e < n) {
       const c = s.charCodeAt(e);
-      if (c === 32 || c === 10 || c === 9 || c === 60 || c < 32) break;
+      // A ']' ends the URL: it closes the link text the autolink sits in.
+      if (c === 32 || c === 10 || c === 9 || c === 60 || c === 93 || c < 32) break;
       e++;
     }
     if (e === i + schemeLen) return null;
@@ -976,7 +992,7 @@ function scanGfmEmail(s, i) {
   let e = i + 1;
   while (e < n) {
     const c = s.charCodeAt(e);
-    if (c === 32 || c === 10 || c === 9 || c === 60 || c < 32) break;
+    if (c === 32 || c === 10 || c === 9 || c === 60 || c === 93 || c < 32) break;
     e++;
   }
   // Find where the e-mail ends: scan the domain (alnum, -, .) and stop at
@@ -1322,6 +1338,9 @@ function scanInline(s, refs) {
             plainText(frame.c, altParts);
             cur.c.push({ t: 'img', src: formed.href, title: formed.title, alt: altParts.join('') });
           } else {
+            // An autolink inside a bracket link's text renders as plain
+            // text, not as a nested <a>.
+            flattenAutolinks(frame.c);
             cur.c.push({ t: 'link', href: formed.href, title: formed.title, c: frame.c });
             cur.hasLink = true;
           }
@@ -1340,8 +1359,10 @@ function scanInline(s, refs) {
       case 60: { // < — autolink or raw HTML
         const auto = scanAngleAutolink(s, i);
         if (auto) {
-          cur.c.push({ t: 'link', href: auto.href, title: null, c: [{ t: 'text', s: auto.text }] });
-          cur.hasLink = true;
+          // An autolink does not count as a link for the "a link cannot
+          // contain a link" rule: a bracket link may still form around it.
+          // Mark it `auto` so it can be flattened to text inside one.
+          cur.c.push({ t: 'link', href: auto.href, title: null, c: [{ t: 'text', s: auto.text }], auto: true });
           i = auto.end;
           break;
         }
@@ -1381,11 +1402,12 @@ function scanInline(s, refs) {
         i++;
         break;
       }
-      case 119: case 104: case 87: case 72: { // w / h / W / H — maybe a www. or http(s):// autolink
+      case 119: case 104: case 72: { // w / h / H — maybe a www. or http(s):// autolink
         const g = scanGfmAutolink(s, i);
         if (g) {
-          cur.c.push({ t: 'link', href: g.href, title: null, c: [{ t: 'text', s: g.text }] });
-          cur.hasLink = true;
+          // A GFM autolink does not count as a link for the "a link
+          // cannot contain a link" rule.
+          cur.c.push({ t: 'link', href: g.href, title: null, c: [{ t: 'text', s: g.text }], auto: true });
           i = g.end;
         } else { pushText(cur.c, s[i]); i++; }
         break;
@@ -1393,8 +1415,9 @@ function scanInline(s, refs) {
       case 64: { // @ — maybe a bare e-mail autolink
         const g = scanGfmEmail(s, i);
         if (g && trimTextEnd(cur, i - g.start)) {
-          cur.c.push({ t: 'link', href: g.href, title: null, c: [{ t: 'text', s: g.text }] });
-          cur.hasLink = true;
+          // An e-mail autolink does not count as a link for the "a link
+          // cannot contain a link" rule.
+          cur.c.push({ t: 'link', href: g.href, title: null, c: [{ t: 'text', s: g.text }], auto: true });
           i = g.end;
         } else { pushText(cur.c, '@'); i++; }
         break;
@@ -1448,6 +1471,26 @@ function indentOf(line, pos) {
 // whitespace starting at `pos`. A partially consumed tab becomes spaces.
 // Caller must ensure the line has at least `k` columns of indent; when the
 // line runs out first, the remainder is empty.
+// Expand tabs in `s` to spaces, assuming `s` starts at absolute column
+// `startCol`. A tab advances to the next multiple of four.
+function expandTabs(s, startCol) {
+  if (s.indexOf('\t') < 0) return s;
+  let out = '';
+  let col = startCol;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 9) {
+      const next = col + 4 - (col % 4);
+      out += ' '.repeat(next - col);
+      col = next;
+    } else {
+      out += s[i];
+      col++;
+    }
+  }
+  return out;
+}
+
 function stripCols(line, pos, k) {
   let col = 0;
   let i = pos;
@@ -1463,6 +1506,20 @@ function stripCols(line, pos, k) {
       // A non-whitespace character: nothing more to strip.
       return line.slice(i);
     }
+  }
+  return line.slice(i);
+}
+
+// Strip up to `k` columns from the start of `line` for fenced code
+// content. Unlike stripCols, a tab counts as a single column: a tab at
+// the strip boundary is consumed whole, not expanded to spaces.
+function stripFenceCols(line, k) {
+  let i = 0;
+  let col = 0;
+  while (col < k && i < line.length) {
+    const c = line.charCodeAt(i);
+    if (c === 32 || c === 9) { col++; i++; }
+    else break;
   }
   return line.slice(i);
 }
@@ -2001,8 +2058,11 @@ function parseBlocks(lines, refs) {
   // Does `content` start a block that can interrupt a paragraph, for the
   // purpose of deciding whether a line is a lazy continuation? Setext
   // underlines do not count (a lazy line cannot be a setext for a paragraph
-  // at another level). An ordered list interrupts only when it starts
-  // with 1, and a bullet list only when its first item is non-empty.
+  // at another level). A list interrupts a paragraph only when its first
+  // item is non-empty; at the top level an ordered list must also start
+  // with 1. Inside a container (a list item or a quote), a matched line
+  // is a proper block start, so any non-empty list marker starts a
+  // nested list, whatever its start number.
   function interruptsPara(content) {
     if (scanAtx(content, 0)) return true;
     if (scanFence(content, 0)) return true;
@@ -2011,10 +2071,9 @@ function parseBlocks(lines, refs) {
     if (scanQuoteMarker(content, 0)) return true;
     const mk = scanListMarker(content, 0);
     if (mk) {
-      // A list interrupts a paragraph only when its first item is
-      // non-empty; an ordered list must also start with 1.
       const after = content.slice(mk.markerEnd);
       if (after.trim() === '') return false;
+      if (stack.length > 0) return true;
       if (mk.ordered) return mk.startNum === 1;
       return true;
     }
@@ -2207,7 +2266,9 @@ function parseBlocks(lines, refs) {
             close[2] === '') {
           fenceState = null;
         } else {
-          fenceState.lines.push(stripCols(fcontent, 0, fenceState.indent));
+          // Tabs in fenced code are preserved as-is; only the fence
+          // indent is stripped.
+          fenceState.lines.push(stripFenceCols(fcontent, fenceState.indent));
         }
         continue;
       }
